@@ -1,0 +1,157 @@
+#include <iostream>
+#include <algorithm>
+#include <typeinfo>
+
+#include "graph.cuh"
+#include "gettime.h"
+#include "MST.h"
+#include "parallel.h"
+#include <thrust/device_vector.h>
+#include <thrust/reduce.h>
+#include <thrust/sort.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+
+const int BlockSize = 256;
+
+using namespace std;
+
+struct Graph {
+  intT    *edges_src;
+  intT    *edges_dst;
+  double  *edges_weight;
+
+  intT n; // vertex count
+  intT m; // edge count
+
+  Graph(const wghEdgeArray<intT>& G) {
+    edges_src = new intT[G.m];
+    edges_dst = new intT[G.m];
+    edges_weight = new double[G.m];
+    n = G.n;
+    m = G.m;
+
+    for (intT i = 0; i < G.m; ++i) {
+      edges_src[i] = G.E[i].u;
+      edges_dst[i] = G.E[i].v;
+      edges_weight[i] = G.E[i].weight;
+    }
+  }
+};
+
+
+template<typename T>
+struct tuple_equal_to : public thrust::binary_function<T, T, bool> {
+  __host__ __device__
+  bool operator() (const T& a, const T& b) const {
+    return (thrust::get<0>(a) == thrust::get<0>(b));
+  }
+};
+
+__global__
+void remove_circles(intT *input, intT *output, intT size) {
+  int pos = threadIdx.x + blockIdx.x * blockDim.x;
+  if (pos < size) {
+    output[pos] = ((input[pos] > pos) && (input[input[pos]] == pos)) ? pos : input[pos];
+  }
+}
+
+__global__
+void merge_vertices(intT *successors, intT size) {
+  int pos = threadIdx.x + blockIdx.x * blockDim.x;
+
+  bool goon = true;
+  int i = 0;
+  while (goon && (i++) < 50) {
+    intT successor = successors[pos];
+    intT ssuccessor= successors[successor];
+
+    if ((ssuccessor != successor) && (pos > successor)) {
+      successors[pos] = ssuccessor;
+    }
+    goon = __any(ssuccessor != successor);
+    __syncthreads();
+  }
+}
+
+void recursive_mst(thrust::device_vector<intT>& srcs, thrust::device_vector<intT>& dsts, thrust::device_vector<double>& weights) {
+  thrust::device_vector<intT>   d_min_srcs(srcs.size());
+  thrust::device_vector<intT>   d_min_dsts(srcs.size());
+  thrust::device_vector<double> d_min_weights(weights.size());
+
+  cout << "A: ";
+  for (int i = 0; i < srcs.size(); ++i) {
+    cout << srcs[i] << " ";
+  }
+  cout << endl;
+  cout << "A: ";
+  for (int i = 0; i < dsts.size(); ++i) {
+    cout << dsts[i] << " ";
+  }
+  cout << endl;
+  auto new_last = thrust::reduce_by_key(
+      thrust::make_zip_iterator(thrust::make_tuple(srcs.begin(), dsts.begin())),
+      thrust::make_zip_iterator(thrust::make_tuple(srcs.end(),   dsts.end())),
+      weights.begin(),
+      thrust::make_zip_iterator(thrust::make_tuple(d_min_srcs.begin(), d_min_dsts.begin())),
+      d_min_weights.begin(),
+      tuple_equal_to<thrust::tuple<intT, intT>>(),
+      thrust::minimum<double>());
+
+  intT forest_size = new_last.second - d_min_weights.begin();
+  cout << "B: ";
+  for (int i = 0; i < forest_size; ++i) {
+    cout << d_min_srcs[i] << " ";
+  }
+  cout << endl;
+  cout << "B: ";
+  for (int i = 0; i < forest_size; ++i) {
+    cout << d_min_dsts[i] << " ";
+  }
+  cout << endl;
+
+  thrust::device_vector<intT> successors(forest_size);
+  remove_circles<<<(forest_size + BlockSize - 1) / BlockSize, BlockSize>>>
+    (thrust::raw_pointer_cast(d_min_dsts.data()), 
+     thrust::raw_pointer_cast(successors.data()), forest_size);
+
+  cout << "S: ";
+  for (int i = 0; i < forest_size; ++i) {
+    cout << successors[i] << " ";
+  }
+  cout << endl;
+
+  merge_vertices<<<(forest_size + BlockSize - 1) / BlockSize, BlockSize>>>
+    (thrust::raw_pointer_cast(successors.data()), forest_size);
+
+  cout << "SS: ";
+  for (int i = 0; i < forest_size; ++i) {
+    cout << successors[i] << " ";
+  }
+  cout << endl;
+}
+
+
+//--------------------------------------------------------------------------------
+// top level mst
+//--------------------------------------------------------------------------------
+std::pair<intT*,intT> mst(wghEdgeArray<intT> G) {
+  startTime();
+  // AOS -> SOA
+  Graph *g = new Graph(G);
+  cout << g->m << endl;
+
+  return;
+  thrust::sort_by_key(g->edges_src, g->edges_src + g->m, 
+      thrust::make_zip_iterator(thrust::make_tuple(g->edges_dst, g->edges_weight)));
+  nextTime("Graph Transform");
+
+  thrust::device_vector<intT>   d_edges_src(g->edges_src, g->edges_src + g->m);
+  thrust::device_vector<intT>   d_edges_dst(g->edges_dst, g->edges_dst + g->m);
+  thrust::device_vector<double> d_edges_weight(g->edges_weight, g->edges_weight + g->m);
+
+  nextTime("MST");
+
+  recursive_mst(d_edges_src, d_edges_dst, d_edges_weight);
+  free(g);
+}
