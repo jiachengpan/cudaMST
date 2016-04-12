@@ -37,11 +37,11 @@ void print_vector(const T& vec, string text) {
   cout << endl;
 }
 
-void print_edges(const thrust::device_vector<edgei>& vec, size_t size, string text) {
+void print_edges(const thrust::device_vector<edgei>& vec, const thrust::device_vector<double>& weights, size_t size, string text) {
   cout << text << endl;
   for (size_t i = 0; i < size; ++i) {
     edgei e = vec[i];
-    cout << " " << e.u << " " << e.v << /*" " << e.weight <<*/ endl;
+    cout << " " << e.id << " " << e.u << " " << e.v << " " << weights[i] << endl;
   }
   cout << endl;
 }
@@ -75,27 +75,30 @@ void extract_sources(wghEdge<intT> *input, intT *output, intT size)
 }
 
 __global__
-void scatter_successors(edgei *input, intT *output, size_t size)
+void scatter_successors(edgei *input, intT *output, intT* output_idx, size_t size)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
 
   if (pos < size) {
     edgei edge = input[pos];
     output[edge.u] = edge.v;
+    output_idx[edge.u] = edge.id;
   }
 }
 
 __global__
-void remove_circles(intT *successors, size_t size)
+void remove_circles(intT *successors, size_t size, intT *aux)
 {
   const uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x;
   if (pos < size) {
     intT successor   = successors[pos];
     intT s_successor = successors[successor];
 
-    if ((successor > pos) && (s_successor != successor)) {
+    if ((successor > pos) && (s_successor == pos)) {
       successors[pos] = pos;
+      successor = pos;
     }
+    aux[pos] = (successor != pos);
   }
 }
 
@@ -106,9 +109,11 @@ void merge_vertices(intT *successors, size_t size)
 
   if (pos < size) {
     bool goon = true;
+
     while (goon) {
       intT successor = successors[pos];
       intT ssuccessor= successors[successor];
+      __syncthreads();
 
       if (ssuccessor != successor) {
         successors[pos] = ssuccessor;
@@ -161,7 +166,7 @@ void update_edges_with_new_vertices(
 // functors
 //--------------------------------------------------------------------------------
 
-struct binop_sort_by_edge_src {
+struct binop_sort_by_edge {
   __host__ __device__ __forceinline__
   bool operator() (const edgei& a, const edgei& b) const {
     return (a.u == b.u) ? (a.v < b.v) : (a.u < b.u);
@@ -179,7 +184,9 @@ struct binop_tuple_minimum {
   typedef thrust::tuple<edgei, double> T;
   __host__ __device__
   T operator() (const T& a, const T& b) const {
-    return (thrust::get<1>(a) < thrust::get<1>(b)) ? a : b;
+    return (thrust::get<1>(a) == thrust::get<1>(b)) ? 
+      ((thrust::get<0>(a).v < thrust::get<0>(b).v) ? a : b) :
+      ((thrust::get<1>(a) < thrust::get<1>(b) ? a : b));
   }
 };
 
@@ -190,140 +197,129 @@ struct unary_get_edge_id {
   }
 };
 
-void recursive_mst(
-    const thrust::device_vector<edgei>& edges,
-    const thrust::device_vector<double>& edge_weights,
-    intT n,
-    thrust::device_vector<intT>& mst_edges,
-    intT& mst_size)
+void recursive_mst_loop(
+    thrust::device_vector<edgei>&   edges,
+    thrust::device_vector<double>&  edge_weights,
+    intT n_vertices,
+    thrust::device_vector<intT>&    mst_edges,
+    intT &n_mst)
 {
-  if (edges.empty()) return;
-  if (edges.size() == 1) {
-    edgei edge = edges[0];
-    mst_edges[mst_size++] = edge.id;
-    return;
+  size_t n_edges = edges.size();
+  thrust::device_vector<edgei>  edges_temp(n_edges);
+  thrust::device_vector<double> edge_weights_temp(n_edges);
+
+  thrust::device_vector<edgei>  temp(n_edges);
+  thrust::device_vector<intT>   edges_aux(n_edges);
+  thrust::device_vector<intT>   edges_idx(n_edges);
+
+  thrust::device_vector<intT>   succ(n_vertices);
+  thrust::device_vector<intT>   succ_idx(n_vertices);
+  thrust::device_vector<intT>   succ_aux(n_vertices);
+  thrust::device_vector<intT>   succ_tmp(n_vertices);
+
+  while (1) {
+    if (n_edges == 1) {
+      edgei edge = edges[0];
+      mst_edges[n_mst++] = edge.id;
+      //cout << "MST: " << n_mst << endl;
+      print_vector(mst_edges, "mst_edges");
+      return;
+    }
+    thrust::sort_by_key(edges.begin(), edges.begin()+n_edges, edge_weights.begin(),
+        binop_sort_by_edge());
+
+    //print_edges(edges, edge_weights, n_edges, "edges: ");
+    auto new_last = thrust::reduce_by_key(
+        edges.begin(), edges.begin()+n_edges,
+        thrust::make_zip_iterator(thrust::make_tuple(
+            edges.begin(), edge_weights.begin())),
+        temp.begin(),
+        thrust::make_zip_iterator(thrust::make_tuple(
+            edges_temp.begin(), edge_weights_temp.begin())),
+        binop_equal_to(),
+        binop_tuple_minimum());
+
+    size_t n_min_edges = new_last.first - temp.begin();
+
+    //print_edges(edges_temp, edge_weights_temp, n_edges, "edges temp: ");
+
+    thrust::sequence(succ.begin(), succ.begin()+n_vertices);
+
+    scatter_successors<<<(n_min_edges + BlockSize - 1) / BlockSize, BlockSize>>>
+      (thrust::raw_pointer_cast(edges_temp.data()),
+       thrust::raw_pointer_cast(succ.data()),
+       thrust::raw_pointer_cast(succ_idx.data()), n_min_edges);
+
+    // succ_tmp stores which succ are to be saved (1)/ dumped
+    remove_circles<<<(n_vertices + BlockSize - 1) / BlockSize, BlockSize>>>
+      (thrust::raw_pointer_cast(succ.data()), n_vertices,
+       thrust::raw_pointer_cast(succ_tmp.data()));
+    thrust::exclusive_scan(succ_tmp.begin(), succ_tmp.begin()+n_vertices, succ_aux.begin());
+    // save new mst edges
+    thrust::scatter_if(succ_idx.begin(), succ_idx.begin()+n_vertices,
+        succ_aux.begin(), succ_tmp.begin(), mst_edges.begin()+n_mst);
+    n_mst += succ_aux[n_vertices-1]+1;
+
+    //print_vector(succ_idx, "succ_idx");
+    //print_vector(succ_aux, "succ_aux target");
+    //print_vector(succ_tmp, "succ_tmp stencil");
+    //print_vector(mst_edges, "mst_edges");
+    //cout << "n_mst: " << n_mst << endl;
+
+
+    // generating super vertices (new vertices)
+    thrust::sequence(succ_idx.begin(), succ_idx.begin()+n_vertices);
+    merge_vertices<<<(n_vertices + BlockSize - 1) / BlockSize, BlockSize>>>
+      (thrust::raw_pointer_cast(succ.data()), n_vertices);
+
+    thrust::sort_by_key(succ.begin(), succ.begin()+n_vertices, succ_idx.begin());
+
+    mark_segments<<<(n_vertices + BlockSize - 1) / BlockSize, BlockSize>>>
+      (thrust::raw_pointer_cast(succ.data()),
+       thrust::raw_pointer_cast(succ_tmp.data()), n_vertices);
+
+    // new_vertices stored for subsequent calls to do query about next-vertice id
+    thrust::device_vector<intT>& new_vertices = succ;
+    thrust::exclusive_scan(succ_tmp.begin(), succ_tmp.begin()+n_vertices, succ_aux.begin());
+    thrust::scatter(succ_aux.begin(), succ_aux.begin()+n_vertices, 
+        succ_idx.begin(), new_vertices.begin());
+
+    intT new_vertice_size = succ_aux[n_vertices-1] + succ_tmp[n_vertices-1];
+
+    //cout << "new_vertice_size: " << new_vertice_size << endl;
+
+    // generating new edges
+    mark_edges_to_keep<<<(n_edges + BlockSize - 1) / BlockSize, BlockSize>>>
+      (thrust::raw_pointer_cast(edges.data()),
+       thrust::raw_pointer_cast(new_vertices.data()),
+       thrust::raw_pointer_cast(edges_aux.data()), n_edges);
+    thrust::exclusive_scan(edges_aux.begin(), edges_aux.begin()+n_edges, edges_idx.begin());
+
+    intT new_edge_size = edges_idx[n_edges-1] + edges_aux[n_edges-1];
+    if (!new_edge_size) { return; }
+
+    //cout << "new_edge_size: " << new_edge_size << endl;
+
+    thrust::scatter_if(
+      thrust::make_zip_iterator(thrust::make_tuple(
+          edges.begin(), edge_weights.begin())),
+      thrust::make_zip_iterator(thrust::make_tuple(
+          edges.begin()+n_edges, edge_weights.begin()+n_edges)),
+      edges_idx.begin(),
+      edges_aux.begin(), 
+      thrust::make_zip_iterator(thrust::make_tuple(
+          edges_temp.begin(), edge_weights_temp.begin())));
+
+    update_edges_with_new_vertices<<<(new_edge_size + BlockSize - 1) / BlockSize, BlockSize>>>
+      (thrust::raw_pointer_cast(edges_temp.data()),
+       thrust::raw_pointer_cast(new_vertices.data()), new_edge_size);
+
+    edges.swap(edges_temp);
+    edge_weights.swap(edge_weights_temp);
+    n_vertices = new_vertice_size;
+    n_edges = new_edge_size;
   }
-
-  //cout << "edges: " << edges.size() << endl;
-  thrust::device_vector<edgei> new_edges(edges.size());
-  thrust::device_vector<double> new_edge_weights(edges.size());
-  thrust::device_vector<edgei> new_edges_temp(edges.size());
-
-  //print_edges(edges, edges.size(), "edges");
-  //print_vector(edge_weights, "edge_weights");
-
-  // new_edges here refer to the edges with minimum weight in its segment (segmented by u)
-  auto new_last = thrust::reduce_by_key(
-      edges.begin(), edges.end(), 
-      thrust::make_zip_iterator(thrust::make_tuple(
-          edges.begin(), edge_weights.begin())),
-      new_edges_temp.begin(), 
-      thrust::make_zip_iterator(thrust::make_tuple(
-          new_edges.begin(), new_edge_weights.begin())),
-      binop_equal_to(),
-      binop_tuple_minimum());
-
-  size_t forest_size = new_last.first - new_edges_temp.begin();
-  //cout << "forest_size: " << forest_size << endl;
-  // save mst edges
-  thrust::transform(
-      new_edges.begin(), new_edges.begin() + forest_size,
-      mst_edges.begin() + mst_size,
-      unary_get_edge_id());
-  mst_size += forest_size;
-
-  //print_edges(new_edges, forest_size, "new edges");
-  //print_vector(new_edge_weights, "new edge_weights");
-
-  thrust::counting_iterator<intT> first(0);
-  thrust::device_vector<intT> successors(first, first+n);
-  thrust::device_vector<intT> successor_idx(first, first+n);
-  thrust::device_vector<intT> new_vertices(n);
-
-  scatter_successors<<<(forest_size + BlockSize - 1) / BlockSize, BlockSize>>>
-    (thrust::raw_pointer_cast(new_edges.data()),
-     thrust::raw_pointer_cast(successors.data()), forest_size);
-
-  //print_vector(successors, "successors");
-
-  // we dont need to remove circles as long as we get an edge list
-  // which doesnt have duplicate of the same undirected edge
-  remove_circles<<<(n + BlockSize - 1) / BlockSize, BlockSize>>>
-    (thrust::raw_pointer_cast(successors.data()), n);
-  merge_vertices<<<(n + BlockSize - 1) / BlockSize, BlockSize>>>
-    (thrust::raw_pointer_cast(successors.data()), n);
-  //print_vector(successors, "merged successors");
-  
-  thrust::sort_by_key(successors.begin(), successors.end(), successor_idx.begin());
-  //print_vector(successor_idx, "sorted successors_idx");
-  //print_vector(successors, "sorted successors");
-
-  mark_segments<<<(n + BlockSize - 1) / BlockSize, BlockSize>>>
-    (thrust::raw_pointer_cast(successors.data()),
-     thrust::raw_pointer_cast(new_vertices.data()), n);
-  //print_vector(new_vertices, "marked segments");
-
-  thrust::exclusive_scan(new_vertices.begin(), new_vertices.end(), successors.begin());
-  //print_vector(successors, "shuffled new vertices");
-
-  intT new_vertices_size = 
-    new_vertices[new_vertices.size()-1] + successors[successors.size()-1];
-  //cout << "new_vertices_size: " << new_vertices_size << endl;
-
-  thrust::scatter(successors.begin(), successors.end(),
-      successor_idx.begin(), new_vertices.begin());
-
-  //print_vector(new_vertices, "new_vertices");
-
-  thrust::device_vector<intT> new_edge_idx(edges.size());
-  thrust::device_vector<intT> new_edge_keep(edges.size());
-
-  // new_edges here refer to the new edges for the next recursion
-  mark_edges_to_keep<<<(edges.size() + BlockSize - 1) / BlockSize, BlockSize>>>
-    (thrust::raw_pointer_cast(edges.data()),
-     thrust::raw_pointer_cast(new_vertices.data()),
-     thrust::raw_pointer_cast(new_edge_keep.data()), edges.size());
-
-  //print_vector(new_edge_keep, "new edges keep");
-
-  thrust::exclusive_scan(new_edge_keep.begin(), new_edge_keep.end(), new_edge_idx.begin());
-
-  //print_vector(new_edge_idx, "new edges idx");
-  intT new_edge_size = new_edge_idx[edges.size()-1] + new_edge_keep[edges.size()-1];
-
-  //cout << "new_edge_size: " << new_edge_size << endl;
-  if (!new_edge_size) { return; }
-
-  thrust::scatter_if(
-      thrust::make_zip_iterator(thrust::make_tuple(
-          edges.begin(), edge_weights.begin())),
-      thrust::make_zip_iterator(thrust::make_tuple(
-          edges.end(), edge_weights.end())),
-      new_edge_idx.begin(),
-      new_edge_keep.begin(), 
-      thrust::make_zip_iterator(thrust::make_tuple(
-          new_edges.begin(), new_edge_weights.begin())));
-
-  update_edges_with_new_vertices<<<(new_edge_size + BlockSize - 1) / BlockSize, BlockSize>>>
-    (thrust::raw_pointer_cast(new_edges.data()),
-     thrust::raw_pointer_cast(new_vertices.data()), new_edge_size);
-
-  //for (int i = 0; i < new_edge_size; ++i) {
-  //  edgei e = new_edges[i];
-  //  double w = new_edge_weights[i];
-  //  printf(" (%d, %d) %lf\n", e.u, e.v, w);
-  //}
-  //cout << endl;
-
-  new_edges.resize(new_edge_size);
-  new_edge_weights.resize(new_edge_size);
-  recursive_mst(
-      new_edges, new_edge_weights,
-      new_vertices_size,
-      mst_edges,
-      mst_size);
 }
-
 
 //--------------------------------------------------------------------------------
 // top level mst
@@ -331,31 +327,28 @@ void recursive_mst(
 std::pair<intT*,intT> mst(wghEdgeArray<intT> G)
 {
   startTime();
+  vector<edgei> h_edges(G.m<<1);
+  vector<double> h_weights(G.m<<1);
+  for (size_t i = 0; i < G.m; ++i) {
+    h_edges[i*2]    = edgei(G.E[i].v, G.E[i].u, i);
+    h_edges[i*2+1]  = edgei(G.E[i].u, G.E[i].v, i);
+    h_weights[i*2]  = G.E[i].weight;
+    h_weights[i*2+1]= G.E[i].weight;
+  }
 
-  thrust::device_vector<wghEdge<intT>> input_edges(G.E, G.E+G.m);
-  thrust::device_vector<edgei> edges(G.m);
-  thrust::device_vector<double> edge_weights(G.m);
-  thrust::device_vector<intT> mst_edges(G.m);
+  thrust::device_vector<edgei>  edges(h_edges.begin(), h_edges.end());
+  thrust::device_vector<double> edge_weights(h_weights.begin(), h_weights.end());
+  thrust::device_vector<intT>   mst_edges(G.m);
 
-  transform_edge_to_edgei<<<(G.m + BlockSize - 1) / BlockSize, BlockSize>>>
-    (thrust::raw_pointer_cast(input_edges.data()),
-     thrust::raw_pointer_cast(edges.data()),
-     thrust::raw_pointer_cast(edge_weights.data()), G.m);
-
-  thrust::sort_by_key(edges.begin(), edges.end(), edge_weights.begin(),
-      binop_sort_by_edge_src());
-
-  nextTime("SortGraph");
+  nextTime("prepare graph");
 
   intT mst_size = 0;
-  recursive_mst(edges, edge_weights, G.n, mst_edges, mst_size);
+  recursive_mst_loop(edges, edge_weights, G.n, mst_edges, mst_size);
 
   intT *result_mst_edges = new intT[mst_size];
   cudaMemcpy(result_mst_edges, thrust::raw_pointer_cast(mst_edges.data()),
       sizeof(intT) * mst_size, cudaMemcpyDeviceToHost);
 
-  //thrust::host_vector<intT> result_mst_edges(mst_edges.begin(), mst_edges.begin()+mst_size);
-  //
   nextTime("MST");
   return make_pair(result_mst_edges, mst_size);
 }
