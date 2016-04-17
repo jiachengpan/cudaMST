@@ -12,7 +12,7 @@
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/iterator/constant_iterator.h>
 
-const int BlockSize = 128;
+const int BlockSize = 256;
 
 using namespace std;
 
