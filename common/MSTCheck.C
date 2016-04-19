@@ -97,8 +97,8 @@ int parallel_main(int argc, char* argv[]) {
 
   free(weights);
 
-  if(total != correctTotal) {
-    cout << "MST has a weight of " << total << " but should have a weight of " << correctTotal << endl;
+  if((total - correctTotal) > 0.0000001) {
+    cout << "MST has a weight of " << total << " but should have a weight of " << correctTotal << " " << total - correctTotal << endl;
     return (1);
   }
 
