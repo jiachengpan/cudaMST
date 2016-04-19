@@ -1,7 +1,7 @@
 CUDA MST
 ========
 
-This repo implements 
+This repo implements following two papers using CUDA so as to accelerate MST computation:
 
 1. *Chapter 7 Fast Minimum Spanning Tree Computation* of *GPU Computing Gems*, a data-parallel MST based on Boruvka's algorithm.
 2. *Fast and Memory-Efficient Minimum Spanning Tree on the GPU*, a data-parallel Kruskal's MST algorithm, which lies between serial Kruskal's and parallel Boruvka's in terms of parallelism.
